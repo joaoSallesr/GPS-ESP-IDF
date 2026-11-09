@@ -1,172 +1,13 @@
-#include <math.h>
-#include <stdatomic.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <string.h>
-
-#include "esp_bit_defs.h"
-#include "esp_err.h"
-#include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
-#include "driver/gpio.h"
-#include "driver/uart.h"
+#include "header.h"
 
 static const char *TAG_GPS = "GPS";
 static const char *TAG_RTK = "RTK";
 
-/* ---------------------------- System config ---------------------------- */
-#define GPS_TX GPIO_NUM_14 // ESP RX  <- GPS TX
-#define GPS_RX GPIO_NUM_12 // ESP TX  -> GPS RX
+static portMUX_TYPE xGPSMutex = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t xTaskLog  = NULL;
 
-#define GPS_UART_NUM       UART_NUM_1
-#define GPS_BAUDRATE       115200
-#define GPS_RX_CHUNK       128
-#define GPS_BUFF_SIZE      4096
-#define GPS_SAMPLE_RATE_MS 200 // 5 Hz
-
-/* ---------------------------- Sample types ---------------------------- */
-typedef struct {
-    int32_t latitude;     // deg * 1e-7, + = N
-    int32_t longitude;    // deg * 1e-7, + = E
-    float   altitude;     // m above calibrated pad altitude
-    float   vel_vertical; // m/s, up positive
-    uint8_t sAcc;         // speed accuracy * 10 (m/s)
-    uint8_t fix;          // gpsFix type, 0 if not OK
-} gps_sample_t;
-
-// RINEX file
-typedef struct {
-    uint8_t numSV;                // # of satellites following
-    double  carrier_phase[32];    // L1 cycles
-    double  pseudorange_meas[32]; // m
-    float   doppler_meas[32];     // Hz
-    uint8_t sv_id[32];            // Space Vehicle Number
-    uint8_t meas_quality[32];     // Nav Measurements Quality Indicator
-    int8_t  signal_strength[32];  // dbHz
-    uint8_t lli[32];              // Loss of lock indicator (RINEX)
-} rtk_sample_t;
-
-static gps_sample_t gps_sample_g = {0};
-static rtk_sample_t rtk_sample_g = {0};
-static portMUX_TYPE xGPSMutex    = portMUX_INITIALIZER_UNLOCKED;
-static TaskHandle_t xTaskLog     = NULL;
-
-#define GPS_BIT BIT(0)
-#define RTK_BIT BIT(1)
-
-static atomic_bool on_pad = true;
-
-/* ---------------------------- UBX config ---------------------------- */
-#define UBX_SYNC1       0xB5
-#define UBX_SYNC2       0x62
-#define UBX_MAX_PAYLOAD 1024
-#define UBX_HDR_LEN     4 // class, id, len_l, len_h
-#define UBX_CK_LEN      2
-
-#define UBX_ACK_TIMEOUT_MS 1500
-#define UBX_ACK_RETRIES    3
-
-#define UBX_POSLLH BIT(0)
-#define UBX_VELNED BIT(1)
-#define UBX_STATUS BIT(2)
-#define HAVE_ALL   (UBX_STATUS | UBX_VELNED | UBX_POSLLH)
-
-#define CAL_MIN_SAMPLES 20
-#define CAL_MAX_SAMPLES 200
-#define CAL_VACC_MAX_MM 5000
-
-static bool streaming = false;
-
-/* ---------------------------- GPS config ---------------------------- */
-#define UBLOX6_ACTIVE   1
-#define UBLOX7_ACTIVE   0
-#define GPS_DATA_ACTIVE 0
-#define RTK_DATA_ACTIVE 1
-
-typedef enum {
-    ACK_NONE,
-    ACK_OK,
-    ACK_NAK,
-} ubx_ack_t;
-
-typedef struct {
-    uint8_t class;
-    uint8_t id;
-    uint8_t payload[UBX_MAX_PAYLOAD];
-    uint8_t len;
-} ubx_cmd_t;
-
-static struct {
-    uint8_t   class;
-    uint8_t   id;
-    ubx_ack_t response;
-} ack_state;
-
-static struct {
-    uint8_t  numSV;
-    uint16_t pDOP; // x0.01
-    bool     valid;
-    char     swVersion[30];
-    char     hwVersion[10];
-} gps_info;
-
-static struct {
-    uint32_t itow;
-    uint8_t  have;
-    bool     fix_ok;
-} epoch;
-
-static struct {
-    float    hmsl_m;
-    uint32_t vacc_mm;
-    float    mean;
-    uint32_t cnt;
-} alt_cal;
-
-// {class, id, payload[len], len}
-static const ubx_cmd_t gps_config[] = {
-    // CFG-MSG: disable NMEA sentences (class 0xF0)
-    {0x06, 0x01, {0xF0, 0x00, 0x00}, 3}, // GGA off
-    {0x06, 0x01, {0xF0, 0x01, 0x00}, 3}, // GLL off
-    {0x06, 0x01, {0xF0, 0x02, 0x00}, 3}, // GSA off
-    {0x06, 0x01, {0xF0, 0x03, 0x00}, 3}, // GSV off
-    {0x06, 0x01, {0xF0, 0x04, 0x00}, 3}, // RMC off
-    {0x06, 0x01, {0xF0, 0x05, 0x00}, 3}, // VTG off
-
-    // CFG-MSG: enable UBX messages
-    {0x06, 0x01, {0x01, 0x02, 0x01}, 3}, // NAV-POSLLH on
-    {0x06, 0x01, {0x01, 0x12, 0x01}, 3}, // NAV-VELNED on
-    {0x06, 0x01, {0x01, 0x03, 0x01}, 3}, // NAV-STATUS on
-    {0x06, 0x01, {0x01, 0x06, 0x05}, 3}, // NAV-SOL on, every 5th epoch
-
-    // CFG-RATE: measRate, navRate 1, GPS time
-    {0x06, 0x08, {GPS_SAMPLE_RATE_MS & 0xFF, GPS_SAMPLE_RATE_MS >> 8, 0x01, 0x00, 0x01, 0x00}, 6},
-
-    // CFG-NAV5: dynModel only, Pedestrian (3)
-    {0x06, 0x24, {0x01, 0x00, 0x03}, 36},
-
-// CFG-NAV5: dynModel only, Airborne <4g (8) -- use this for actual flight
-//{0x06, 0x24, {0x01, 0x00, 0x08}, 36},
-
-/* RTK MESSAGES */
-#if UBLOX6_ACTIVE
-    // CFG-MSG: enable RXM messages
-    {0x06, 0x01, {0x02, 0x10, 0x01}, 3}, // RXM-RAW on
-    {0x06, 0x01, {0x02, 0x11, 0x01}, 3}, // RXM-SFRB on
-#endif
-
-#if UBLOX7_ACTIVE
-    // CFG-MSG: enable TRK messages
-    {0x06, 0x01, {0x03, 0x0A, 0x01}, 3}, // TRK-TRKD5 on
-    {0x06, 0x01, {0x03, 0x0F, 0x01}, 3}, // TRK-SFRBX on
-
-    // CFG-MSG: enable NAV messages
-    {0x06, 0x01, {0x01, 0x22, 0x01}, 3}, // NAV-CLOCK on
-    {0x06, 0x01, {0x01, 0x30, 0x01}, 3}, // NAV-SVINFO on
-#endif
-};
+static atomic_bool on_pad    = true;
+static bool        streaming = false;
 
 /* ---------------------------- RTK ---------------------------- */
 #if UBLOX6_ACTIVE
@@ -223,7 +64,6 @@ static inline void ubx_epoch_post(uint8_t bit, gps_sample_t *gps) {
     gps->altitude = alt_cal.hmsl_m - alt_cal.mean;
 
 #if GPS_DATA_ACTIVE
-
     portENTER_CRITICAL(&xGPSMutex);
     gps_sample_g.latitude     = gps->latitude;
     gps_sample_g.longitude    = gps->longitude;
@@ -232,7 +72,6 @@ static inline void ubx_epoch_post(uint8_t bit, gps_sample_t *gps) {
     gps_sample_g.sAcc         = gps->sAcc;
     gps_sample_g.fix          = gps->fix;
     portEXIT_CRITICAL(&xGPSMutex);
-
 #endif
 
     if (xTaskLog)
@@ -394,8 +233,6 @@ static void ubx_handle_message(uint8_t class, uint8_t id, const uint8_t *payload
             rtk_sample_g.lli[i]              = lli;
 
             xTaskNotify(xTaskLog, RTK_BIT, eSetBits);
-
-            // add the rest if necessary for RINEX
         }
 
         return;
@@ -533,7 +370,7 @@ static bool gps_set_baudrate(uint32_t baudrate) {
 /* ---------------------------- GPS task ---------------------------- */
 static bool gps_configure(void) {
     bool ok = true;
-    for (int i = 0; i < sizeof(gps_config) / sizeof(gps_config[0]); i++) {
+    for (int i = 0; i < sizeof(ubx_cmd_t) / sizeof(gps_config[0]); i++) {
         const ubx_cmd_t *c = &gps_config[i];
         if (!ubx_send_wait_ack(c->class, c->id, c->payload, c->len, i)) {
             ESP_LOGE(TAG_GPS, "Config %lu failed (0x%02X 0x%02X)", (unsigned long)i, c->class, c->id);
