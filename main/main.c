@@ -3,28 +3,8 @@
 static const char *TAG_GPS = "GPS";
 static const char *TAG_RTK = "RTK";
 
-static portMUX_TYPE xGPSMutex = portMUX_INITIALIZER_UNLOCKED;
-static TaskHandle_t xTaskLog  = NULL;
-
 static atomic_bool on_pad    = true;
 static bool        streaming = false;
-
-/* ---------------------------- RTK ---------------------------- */
-#if UBLOX6_ACTIVE
-static void UBLOX6_ACTIVE_enable_rxm(void) {
-    const uint8_t rxm_raw[] = {0xB5, 0x62, 0x09, 0x01, 0x10, 0x00, 0xC8, 0x16, 0x00, 0x00, 0x00, 0x00,
-                               0x00, 0x00, 0x97, 0x69, 0x21, 0x00, 0x00, 0x00, 0x02, 0x10, 0x2B, 0x22};
-
-    const uint8_t rxm_sfrb[] = {0xB5, 0x62, 0x09, 0x01, 0x10, 0x00, 0x0C, 0x19, 0x00, 0x00, 0x00, 0x00,
-                                0x00, 0x00, 0x83, 0x69, 0x21, 0x00, 0x00, 0x00, 0x02, 0x11, 0x5F, 0xF0};
-
-    uart_write_bytes(GPS_UART_NUM, (const char *)rxm_raw, sizeof(rxm_raw));
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    uart_write_bytes(GPS_UART_NUM, (const char *)rxm_sfrb, sizeof(rxm_sfrb));
-    vTaskDelay(pdMS_TO_TICKS(100));
-}
-#endif
 
 /* ---------------------------- Epoch / calibration ---------------------------- */
 static inline bool altitude_calibration(void) {
@@ -77,6 +57,7 @@ static inline void ubx_epoch_post(uint8_t bit, gps_sample_t *gps) {
     if (xTaskLog)
         xTaskNotify(xTaskLog, GPS_BIT, eSetBits);
 }
+
 /* ---------------------------- UBX parsing ---------------------------- */
 static inline void ubx_checksum(const uint8_t *frame, uint16_t len, uint8_t *ck_a, uint8_t *ck_b) {
     uint8_t a_sum = 0, b_sum = 0;
@@ -191,13 +172,15 @@ static void ubx_handle_message(uint8_t class, uint8_t id, const uint8_t *payload
 
     /* RXM-RAW */
     if (class == 0x02 && id == 0x10 && len >= 32) {
-        uint32_t iTOW;
-        int16_t  week;
-        uint8_t  numSV = payload[6];
+        uint32_t iTOW;               // GPS Millisecond Time of Week (ms)
+        int16_t  week;               // GPS week number (weeks)
+        uint8_t  numSV = payload[6]; // # of satellites following
 
         memcpy(&iTOW, &payload[0], 4);
         memcpy(&week, &payload[4], 2);
 
+        rtk_sample_g.iTOW  = iTOW;
+        rtk_sample_g.week  = week;
         rtk_sample_g.numSV = numSV;
 
         // 8 byte header + 24 byte/satellite
@@ -221,8 +204,9 @@ static void ubx_handle_message(uint8_t class, uint8_t id, const uint8_t *payload
             int8_t  cno   = sv[22]; // Signal strength C/No (dbHz)
             uint8_t lli   = sv[23]; // Loss of lock indicator (RINEX)
 
-            if (mesQI < 5)
-                ESP_LOGW(TAG_RTK, "Invalid Pseudorange value");
+            // mesQI >=4 : PR+DO OK
+            // mesQI >=5 : PR+DO+CP OK
+            // mesQI <6 : likely loss of carrier lock in previous interval
 
             rtk_sample_g.carrier_phase[i]    = cpMes;
             rtk_sample_g.pseudorange_meas[i] = prMes;
@@ -240,13 +224,14 @@ static void ubx_handle_message(uint8_t class, uint8_t id, const uint8_t *payload
 
     /* RXM-SFRB */
     if (class == 0x02 && id == 0x11 && len == 42) {
-
         return;
     }
 }
 
 static void ubx_parse_message(uint8_t c, gps_sample_t *gps) {
-    static enum { SYNC, HEADER, BODY } state = SYNC;
+    static enum { SYNC,
+                  HEADER,
+                  BODY } state = SYNC;
 
     static uint16_t sync;
     static uint8_t  frame[UBX_HDR_LEN + UBX_MAX_PAYLOAD + UBX_CK_LEN];
@@ -370,7 +355,7 @@ static bool gps_set_baudrate(uint32_t baudrate) {
 /* ---------------------------- GPS task ---------------------------- */
 static bool gps_configure(void) {
     bool ok = true;
-    for (int i = 0; i < sizeof(ubx_cmd_t) / sizeof(gps_config[0]); i++) {
+    for (int i = 0; i < gps_config_len; i++) {
         const ubx_cmd_t *c = &gps_config[i];
         if (!ubx_send_wait_ack(c->class, c->id, c->payload, c->len, i)) {
             ESP_LOGE(TAG_GPS, "Config %lu failed (0x%02X 0x%02X)", (unsigned long)i, c->class, c->id);
@@ -404,11 +389,6 @@ static void gps_init(void) {
 
     ESP_LOGI(TAG_GPS, "GPS UART update (baud %d)", GPS_BAUDRATE);
 
-// RTK
-#if UBLOX6_ACTIVE
-    UBLOX6_ACTIVE_enable_rxm();
-#endif
-
     if (!gps_configure())
         ESP_LOGE(TAG_GPS, "GPS configuration failed");
     else
@@ -425,7 +405,7 @@ static void task_gps(void *pvParameters) {
     uint8_t      rx_buffer[GPS_RX_CHUNK];
     gps_sample_t gps = {0};
 
-    ubx_send(0x0A, 0x04, NULL, 0); // MON-VER poll
+    ubx_send_wait_ack(0x0A, 0x04, NULL, 0, 1); // MON-VER poll
 
     TickType_t last_log = 0;
     while (true) {
@@ -474,5 +454,5 @@ static void task_log(void *pvParameters) {
 
 void app_main(void) {
     xTaskCreatePinnedToCore(task_log, "LOG", 4096, NULL, 5, &xTaskLog, 1);
-    xTaskCreatePinnedToCore(task_gps, "GPS", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(task_gps, "GPS", 4096 * 2, NULL, 5, NULL, 1);
 }

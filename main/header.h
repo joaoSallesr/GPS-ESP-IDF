@@ -49,10 +49,12 @@
 #define RTK_BIT BIT(1)
 
 /* ---------------------------- GPS config ---------------------------- */
-#define UBLOX6_ACTIVE   1
-#define UBLOX7_ACTIVE   0
 #define GPS_DATA_ACTIVE 0
 #define RTK_DATA_ACTIVE 1
+
+/* ---------------------------- Handles ---------------------------- */
+extern portMUX_TYPE xGPSMutex;
+extern TaskHandle_t xTaskLog;
 
 /* ---------------------------- Sample structures ---------------------------- */
 typedef struct {
@@ -65,14 +67,16 @@ typedef struct {
 } gps_sample_t;
 
 typedef struct {
-    uint8_t numSV;                        // # of satellites following
-    double  carrier_phase[RTK_MAX_SV];    // L1 cycles
-    double  pseudorange_meas[RTK_MAX_SV]; // m
-    float   doppler_meas[RTK_MAX_SV];     // Hz
-    uint8_t sv_id[RTK_MAX_SV];            // Space Vehicle Number
-    uint8_t meas_quality[RTK_MAX_SV];     // Nav Measurements Quality Indicator
-    int8_t  signal_strength[RTK_MAX_SV];  // dbHz
-    uint8_t lli[RTK_MAX_SV];              // Loss of lock indicator (RINEX)
+    uint32_t iTOW;                         // ms
+    int16_t  week;                         // weeks
+    uint8_t  numSV;                        // # of satellites following
+    double   carrier_phase[RTK_MAX_SV];    // L1 cycles
+    double   pseudorange_meas[RTK_MAX_SV]; // m
+    float    doppler_meas[RTK_MAX_SV];     // Hz
+    uint8_t  sv_id[RTK_MAX_SV];            // Space Vehicle Number
+    uint8_t  meas_quality[RTK_MAX_SV];     // Nav Measurements Quality Indicator
+    int8_t   signal_strength[RTK_MAX_SV];  // dbHz
+    uint8_t  lli[RTK_MAX_SV];              // Loss of lock indicator (RINEX)
 } rtk_sample_t;
 
 typedef enum {
@@ -122,3 +126,4 @@ extern gps_info_t      gps_info;
 extern epoch_t         epoch;
 extern alt_cal_t       alt_cal;
 extern const ubx_cmd_t gps_config[];
+extern const size_t    gps_config_len;
