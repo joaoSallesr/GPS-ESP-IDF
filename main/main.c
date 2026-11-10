@@ -405,7 +405,7 @@ static void task_gps(void *pvParameters) {
     uint8_t      rx_buffer[GPS_RX_CHUNK];
     gps_sample_t gps = {0};
 
-    ubx_send_wait_ack(0x0A, 0x04, NULL, 0, 1); // MON-VER poll
+    ubx_send(0x0A, 0x04, NULL, 0); // MON-VER poll
 
     TickType_t last_log = 0;
     while (true) {
